@@ -1,1 +1,15 @@
 results/*
+
+
+logs/*
+
+*__pycache__*
+*wandb*
+*runs*
+
+*.out
+*.pt
+
+*.err
+
+*.log
