@@ -9,7 +9,7 @@ from datasets import load_dataset
 from utils.prompter import Prompter
 # Load model directly
 from transformers import AutoTokenizer, AutoModelForCausalLM
-
+import random
 
 # model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-2-7b-hf")
 
@@ -40,22 +40,94 @@ def init_vector_db(config_path='./config/config2.json'):
     initialize_index(lora_configs)
 
 def load_peft_model(lora_module_list, base_model):
-    """
-    Load and configure PEFT (Parameter-Efficient Fine-Tuning) adapters onto the base model.
-    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     lora_lists = []
+    
     for i, lora_model in enumerate(lora_module_list):
+        print(f"\nLoading adapter {i}: {lora_model}")
         if i == 0:
             peft_model = PeftModel.from_pretrained(base_model, lora_model, f"adapter{i}")
         else:
             peft_model.load_adapter(lora_model, f"adapter{i}")
         lora_lists.append(f"adapter{i}")
+        
+        # Check what was loaded
+        print(f"Adapter config: {peft_model.peft_config[f'adapter{i}']}")
 
+    print(f"\nSetting adapters: {lora_lists}")
     peft_model.set_adapter(lora_lists)
+    
+    # Debug: Check active adapters and their structure
+    print(f"Active adapters after set_adapter: {peft_model.active_adapters}")
+    
+    # Check a specific layer to see what's there
+    for name, module in peft_model.named_modules():
+        if 'q_proj' in name and hasattr(module, 'lora_A'):
+            print(f"\n{name}:")
+            print(f"  lora_A type: {type(module.lora_A)}")
+            if isinstance(module.lora_A, dict):
+                print(f"  Keys in lora_A: {module.lora_A.keys()}")
+                for key in module.lora_A.keys():
+                    if module.lora_A[key] is not None:
+                        weight_shape = module.lora_A[key].weight.shape if hasattr(module.lora_A[key], 'weight') else 'No weight attr'
+                        print(f"    {key}: {weight_shape}")
+            break  # Just check first q_proj layer
+    
     peft_model = peft_model.to(device)
     peft_model.eval()
     return peft_model
+
+def check_adapter_compatibility(lora_module_list):
+    """Check if all adapters have the same target modules"""
+    from peft import PeftConfig
+    
+    configs = []
+    target_modules = []
+    
+    for lora_model in lora_module_list:
+        config = PeftConfig.from_pretrained(lora_model)
+        configs.append(config)
+        print(f"\n{lora_model}:")
+        print(f"  Target modules: {config.target_modules}")
+        print(f"  LoRA rank (r): {config.r}")
+        print(f"  LoRA alpha: {config.lora_alpha}")
+        
+        # Handle different types of target_modules
+        if isinstance(config.target_modules, set):
+            target_modules.append(config.target_modules)
+        elif isinstance(config.target_modules, list):
+            target_modules.append(set(config.target_modules))
+        else:
+            target_modules.append({config.target_modules})
+    
+    # Check if all have same target modules
+    unique_targets = set(frozenset(tm) for tm in target_modules)
+    
+    if len(unique_targets) > 1:
+        print("\n⚠️ WARNING: Adapters have different target modules!")
+        for i, tm in enumerate(target_modules):
+            print(f"  Adapter {i}: {tm}")
+    else:
+        print("\n✓ All adapters target the same modules")
+        print(f"  Common target modules: {target_modules[0]}")
+    
+    # Check for different ranks or alphas
+    ranks = [cfg.r for cfg in configs]
+    alphas = [cfg.lora_alpha for cfg in configs]
+    
+    if len(set(ranks)) > 1:
+        print("\n⚠️ WARNING: Adapters have different LoRA ranks!")
+        for i, r in enumerate(ranks):
+            print(f"  Adapter {i}: rank={r}")
+    
+    if len(set(alphas)) > 1:
+        print("\n⚠️ WARNING: Adapters have different LoRA alphas!")
+        for i, alpha in enumerate(alphas):
+            print(f"  Adapter {i}: alpha={alpha}")
+    
+    return configs
+
+# Call before loading
 
 def eval_datasets(
     data_path, 
@@ -66,7 +138,8 @@ def eval_datasets(
     batch_size=1, 
     ood=False, 
     best_selection=False, 
-    model_size='7b'
+    model_size='7b',
+    seed=None
 ):
     """
     Evaluate the model on given datasets.
@@ -82,6 +155,14 @@ def eval_datasets(
     - best_selection: If True, use the most appropriate LoRA for each input.
     - model_size: Model size of Llama-2.
     """
+    
+    if seed is not None:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+            
     correct_count = 0
     results = []  # Initialize a list to store question and response data
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -145,10 +226,18 @@ def eval_datasets(
                     for item_idx, item in enumerate(exclude_list):
                         mapping_matrix[item_idx, item_to_index[item]] = 1
 
-                print(module_list)
+                print("module_list:", module_list)
+                if mapping_matrix is None:
+                    raise ValueError("mapping_matrix is None. Retrieval may have failed or returned no adapters.")
                 mapping_matrix_tensor = torch.tensor(mapping_matrix).to(device)
+                print("mapping_matrix_tensor.shape:", mapping_matrix_tensor.shape)
+                print("Number of adapters loaded:", len(module_list))
+                if mapping_matrix_tensor.shape[1] != len(module_list):
+                    raise ValueError(f"Shape mismatch: mapping_matrix_tensor.shape[1] ({mapping_matrix_tensor.shape[1]}) != number of adapters ({len(module_list)}). Please check retrieval logic.")
                 mapping_matrix_tensor = mapping_matrix_tensor.to(torch.bfloat16)
                 mapping_matrix_tensor /= lora_num
+                
+                configs = check_adapter_compatibility(module_list)
                 # Load the PEFT model with selected adapters
                 peft_model = load_peft_model(module_list, base_model)
 
@@ -160,15 +249,22 @@ def eval_datasets(
                     padding=True,
                 ).to(device)
 
+                
+                print("pin1")
                 # Generate model outputs with given parameters
-                outputs = peft_model.generate(
-                    input_ids=inputs["input_ids"],
-                    max_new_tokens=50,
-                    temperature=0.001,
-                    merging_type=eval_type,
-                    lora_mapping=mapping_matrix_tensor
-                )
-
+                try:
+                    outputs = peft_model.generate(
+                        input_ids=inputs["input_ids"],
+                        max_new_tokens=50,
+                        temperature=0.001,
+                        merging_type=eval_type,
+                        lora_mapping=mapping_matrix_tensor
+                        # module_list=module_list  # Ensure adapter stacking order matches mapping matrix
+                    )
+                except Exception as e:
+                    print("exception", e)
+                    continue
+                
                 # Process and store results
                 for j, (output, expected_answer) in enumerate(zip(outputs, eval_data["targets"][i : i + batch_size])):
                     generated_answer = tokenizer.decode(output, skip_special_tokens=True)
@@ -190,6 +286,8 @@ def eval_datasets(
                 peft_model.unload()
 
     # Save the results to a JSON file
+    import os
+    os.makedirs(os.path.dirname(res_path), exist_ok=True)
     with open(res_path, 'w', encoding='utf-8') as f:
         json.dump(results, f, ensure_ascii=False, indent=4)
 

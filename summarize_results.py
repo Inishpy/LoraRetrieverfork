@@ -44,11 +44,24 @@ def process_file(file_path):
     return organized_data
 
 # Function to process all files in a folder and aggregate scores by domain and metric
-def process_folder(folder_path):
+def process_seeds_folder(parent_folder):
+    # Find all seed subfolders
+    seed_folders = [os.path.join(parent_folder, d) for d in os.listdir(parent_folder)
+                    if os.path.isdir(os.path.join(parent_folder, d)) and d.startswith("seed")]
+    if not seed_folders:
+        raise ValueError("No seed subfolders found in {}".format(parent_folder))
+
+    # Get the set of result files from the first seed folder
+    result_files = [f for f in os.listdir(seed_folders[0]) if f.endswith('.json')]
+
+    # Structure: domain -> metric -> file_name -> list of scores (one per seed)
     domain_specific_metrics = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-    for file_name in os.listdir(folder_path):
-        if file_name.endswith('.json'):
-            file_path = os.path.join(folder_path, file_name)
+
+    for file_name in result_files:
+        for seed_folder in seed_folders:
+            file_path = os.path.join(seed_folder, file_name)
+            if not os.path.exists(file_path):
+                continue
             domains_data = process_file(file_path)
 
             for domain, tasks_data in domains_data.items():
@@ -68,30 +81,32 @@ def process_folder(folder_path):
                     elif metric == 'em':
                         score = calculate_em(references, candidates)
                         domain_specific_metrics[domain][metric][file_name].append(score)
-    
-    return domain_specific_metrics
+    return domain_specific_metrics, result_files
 
 # Function to convert data to LaTeX format with domain and metric averages
-def convert_to_latex_modified(data, folder_path):
+def convert_to_latex_mean_std(data, result_files):
     data_list = []
     for domain, metrics in data.items():
         for metric, files in metrics.items():
             row = {'Domain-Metric': f"{domain}-{metric}"}
-            for file_name in os.listdir(folder_path):
-                if file_name.endswith('.json'):
-                    numeric_scores = [score for score in files[file_name] if isinstance(score, (int, float))]
-                    average_score = np.mean(numeric_scores) if numeric_scores else 0
-                    row[file_name] = "{:.1f}".format(average_score)  # Format to one decimal place
+            for file_name in result_files:
+                numeric_scores = [score for score in files[file_name] if isinstance(score, (int, float))]
+                if numeric_scores:
+                    mean = np.mean(numeric_scores)
+                    std = np.std(numeric_scores)
+                    row[file_name] = "{:.1f} ± {:.1f}".format(mean, std)
+                else:
+                    row[file_name] = "-"
             data_list.append(row)
 
     df = pd.DataFrame(data_list)
-    columns_ordered = ['Domain-Metric'] + [file_name for file_name in os.listdir(folder_path) if file_name.endswith('.json')]
+    columns_ordered = ['Domain-Metric'] + result_files
     df = df[columns_ordered]
 
     return df.to_latex(index=False)
 
 # Example usage
 folder_path = 'results'  # Replace with your actual folder path
-processed_data = process_folder(folder_path)
-latex_table = convert_to_latex_modified(processed_data, folder_path)
+processed_data, result_files = process_seeds_folder(folder_path)
+latex_table = convert_to_latex_mean_std(processed_data, result_files)
 print(latex_table)

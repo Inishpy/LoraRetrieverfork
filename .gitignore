@@ -11,5 +11,12 @@ logs/*
 *.pt
 
 *.err
-
+/utils/
 *.log
+*.pyc
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
