@@ -1,6 +1,7 @@
 import os
 import json
 from collections import defaultdict
+from datetime import datetime
 from nltk.translate.bleu_score import sentence_bleu
 from rouge import Rouge
 import numpy as np
@@ -83,6 +84,32 @@ def process_seeds_folder(parent_folder):
                         domain_specific_metrics[domain][metric][file_name].append(score)
     return domain_specific_metrics, result_files
 
+
+def get_latest_timestamp_results_dir(base_results_folder):
+    """Return the latest timestamped results directory under base_results_folder.
+
+    Expected timestamp format: YYYYMMDD_HHMMSS
+    """
+    timestamp_dirs = []
+    for d in os.listdir(base_results_folder):
+        full_path = os.path.join(base_results_folder, d)
+        if not os.path.isdir(full_path):
+            continue
+        try:
+            datetime.strptime(d, "%Y%m%d_%H%M%S")
+            timestamp_dirs.append(d)
+        except ValueError:
+            continue
+
+    if not timestamp_dirs:
+        raise ValueError(
+            "No timestamped result directories found in {}. "
+            "Expected format: YYYYMMDD_HHMMSS".format(base_results_folder)
+        )
+
+    latest_dir = sorted(timestamp_dirs)[-1]
+    return os.path.join(base_results_folder, latest_dir)
+
 # Function to convert data to LaTeX format with domain and metric averages
 def convert_to_latex_mean_std(data, result_files):
     data_list = []
@@ -106,7 +133,8 @@ def convert_to_latex_mean_std(data, result_files):
     return df.to_latex(index=False)
 
 # Example usage
-folder_path = 'results'  # Replace with your actual folder path
+base_results_folder = 'results'
+folder_path = get_latest_timestamp_results_dir(base_results_folder)
 processed_data, result_files = process_seeds_folder(folder_path)
 latex_table = convert_to_latex_mean_std(processed_data, result_files)
 print(latex_table)
