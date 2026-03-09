@@ -210,7 +210,7 @@ def _retrieve_topk_per_layer(query_text, layerwise_index, layer_k=1):
     return hits
 
 
-def _scores_to_normalized_weights(score_by_adapter, chosen_adapters):
+def _scores_to_normalized_weights(score_by_adapter, chosen_adapters, fallback_weights=None):
     """Convert adapter scores to non-negative normalized weights aligned with chosen_adapters."""
     if not chosen_adapters:
         return []
@@ -222,6 +222,12 @@ def _scores_to_normalized_weights(score_by_adapter, chosen_adapters):
     total = float(scores.sum())
 
     if total <= 1e-12:
+        if fallback_weights is not None and len(fallback_weights) == len(chosen_adapters):
+            fallback = np.asarray(fallback_weights, dtype=np.float32)
+            fallback = np.clip(fallback, 0.0, None)
+            fb_total = float(fallback.sum())
+            if fb_total > 1e-12:
+                return (fallback / fb_total).astype(np.float32).tolist()
         # Fallback to uniform to keep mapping well-defined.
         return [1.0 / len(chosen_adapters)] * len(chosen_adapters)
 
@@ -234,19 +240,22 @@ def perform_search(
     exclude_list=None,
     layer_top_k=1,
     return_details=False,
+    return_layerwise_mapping=False,
 ):
     """
     Layer-wise retrieval entrypoint compatible with original API.
 
     Returns:
       - all_results_list: unique selected adapters across query_list
-      - mapping_matrix: binary matrix [batch, len(all_results_list)]
+      - mapping_matrix: global soft weights [batch, len(all_results_list)]
+      - layerwise_mapping_matrix (optional): per-layer soft weights with same row/col layout
     """
     global global_layerwise_index
 
     all_results_set = set()
     selected_per_query = []
     weights_per_query = []
+    layerwise_weights_per_query = []
     retrieval_details = []
 
     for j, query in enumerate(query_list):
@@ -256,20 +265,47 @@ def perform_search(
         )
 
         score_by_adapter = defaultdict(float)
-        for _, per_layer_hits in layer_hits.items():
+        score_by_adapter_per_layer = defaultdict(lambda: defaultdict(float))
+        for layer_name, per_layer_hits in layer_hits.items():
             for hit in per_layer_hits:
                 adapter = hit["lora_path"]
                 if exclude_item is not None and adapter == exclude_item:
                     continue
                 score_by_adapter[adapter] += hit["score"]
+                score_by_adapter_per_layer[layer_name][adapter] += hit["score"]
 
         ranked = sorted(score_by_adapter.items(), key=lambda x: x[1], reverse=True)
-        chosen = [name for name, _ in ranked[:k]]
+        ranked_per_layer = {
+            layer_name: sorted(layer_scores.items(), key=lambda x: x[1], reverse=True)
+            for layer_name, layer_scores in score_by_adapter_per_layer.items()
+        }
+        layerwise_selected_adapters = {
+            layer_name: [name for name, _ in layer_rank[:k]]
+            for layer_name, layer_rank in ranked_per_layer.items()
+        }
+        chosen_set = set()
+        for layer_selected in layerwise_selected_adapters.values():
+            chosen_set.update(layer_selected)
+        if not chosen_set:
+            chosen_set.update([name for name, _ in ranked[:k]])
+        chosen = sorted(chosen_set, key=lambda name: float(score_by_adapter.get(name, 0.0)), reverse=True)
         chosen_weights = _scores_to_normalized_weights(score_by_adapter, chosen)
+
+        layerwise_weight_map = {}
+        for layer_name in layer_hits.keys():
+            layer_weights = _scores_to_normalized_weights(
+                score_by_adapter_per_layer[layer_name],
+                chosen,
+                fallback_weights=chosen_weights,
+            )
+            layerwise_weight_map[layer_name] = {
+                adapter: weight for adapter, weight in zip(chosen, layer_weights)
+            }
 
         all_results_set.update(chosen)
         selected_per_query.append(chosen)
         weights_per_query.append(chosen_weights)
+        layerwise_weights_per_query.append(layerwise_weight_map)
 
         if return_details:
             retrieval_details.append(
@@ -281,6 +317,15 @@ def perform_search(
                     ],
                     "selected_adapters": chosen,
                     "selected_weights": chosen_weights,
+                    "layerwise_selected_adapters": layerwise_selected_adapters,
+                    "layerwise_selected_weights": {
+                        layer_name: [
+                            {"lora_path": adapter, "weight": float(weight_map[adapter])}
+                            for adapter in chosen
+                            if weight_map[adapter] > 0
+                        ]
+                        for layer_name, weight_map in layerwise_weight_map.items()
+                    },
                 }
             )
 
@@ -291,8 +336,29 @@ def perform_search(
         mapping_vector = [float(weight_map.get(result, 0.0)) for result in all_results_list]
         mapping_matrix.append(mapping_vector)
 
+    layerwise_mapping_matrix = {}
+    if return_layerwise_mapping:
+        layer_names = sorted(global_layerwise_index.keys()) if global_layerwise_index else []
+        for layer_name in layer_names:
+            layer_rows = []
+            for chosen, chosen_weights, layer_weight_map in zip(
+                selected_per_query, weights_per_query, layerwise_weights_per_query
+            ):
+                fallback_map = {adapter: weight for adapter, weight in zip(chosen, chosen_weights)}
+                weight_map = layer_weight_map.get(layer_name, fallback_map)
+                layer_rows.append(
+                    [float(weight_map.get(result, 0.0)) for result in all_results_list]
+                )
+            layerwise_mapping_matrix[layer_name] = layer_rows
+
+    if return_details and return_layerwise_mapping:
+        return all_results_list, mapping_matrix, retrieval_details, layerwise_mapping_matrix
+
     if return_details:
         return all_results_list, mapping_matrix, retrieval_details
+
+    if return_layerwise_mapping:
+        return all_results_list, mapping_matrix, layerwise_mapping_matrix
 
     return all_results_list, mapping_matrix
 
@@ -443,7 +509,7 @@ def eval_datasets(
     - config_path: Path to configuration file for retrieval initialization.
     - eval_type: The merging type for LoRA adapters (e.g., 'fusion').
     - eval_types: Optional comma-separated/list composition methods. Use 'all' for all supported.
-    - lora_num: Number of LoRA adapters to be retrieved.
+    - lora_num: Per-layer top-k adapters before forming the global union to load.
     - batch_size: Batch size for evaluation.
     - ood: Flag indicating if out-of-domain exclusion should be applied.
     - best_selection: If True, use the most appropriate LoRA for each input.
@@ -495,12 +561,13 @@ def eval_datasets(
                     else:
                         exclude_list = [f"Styxxxx/llama2_13b_lora-{task}" for task in task_names]
 
-                module_list, mapping_matrix, retrieval_details = perform_search(
+                module_list, mapping_matrix, retrieval_details, layerwise_mapping_matrix = perform_search(
                     input_text,
                     k=lora_num,
                     exclude_list=exclude_list,
                     layer_top_k=layer_top_k,
                     return_details=True,
+                    return_layerwise_mapping=True,
                 )
                 input_text = eval_data["full_prompt"][i : i + batch_size]
 
@@ -516,6 +583,11 @@ def eval_datasets(
                     module_list = unique_items
                     for item_idx, item in enumerate(exclude_list):
                         mapping_matrix[item_idx, item_to_index[item]] = 1
+                    layer_names = sorted(global_layerwise_index.keys()) if global_layerwise_index else []
+                    layerwise_mapping_matrix = {
+                        layer_name: mapping_matrix.astype(np.float32).tolist()
+                        for layer_name in layer_names
+                    }
 
                 print("module_list:", module_list)
                 if mapping_matrix is None:
@@ -545,6 +617,27 @@ def eval_datasets(
                     raise ValueError(
                         "lora_mapping contains negative values; check retrieval/mapping normalization."
                     )
+                layerwise_mapping_tensor = {"__default__": mapping_matrix_tensor}
+                for layer_name, layer_matrix in layerwise_mapping_matrix.items():
+                    layer_tensor = torch.tensor(layer_matrix).to(device)
+                    if layer_tensor.shape[1] != len(module_list):
+                        raise ValueError(
+                            f"Layer {layer_name} shape mismatch: mapping width ({layer_tensor.shape[1]}) "
+                            f"!= number of adapters ({len(module_list)})."
+                        )
+                    layer_row_sums = layer_tensor.sum(dim=1, keepdim=True)
+                    if (layer_row_sums <= 0).any():
+                        raise ValueError(
+                            f"Layer {layer_name} has zero-sum rows in lora_mapping."
+                        )
+                    layer_tensor = layer_tensor / layer_row_sums
+                    layer_tensor = layer_tensor.to(torch.bfloat16)
+                    if not torch.isfinite(layer_tensor).all():
+                        raise ValueError(f"Layer {layer_name} lora_mapping contains NaN/inf.")
+                    if (layer_tensor < 0).any():
+                        raise ValueError(f"Layer {layer_name} lora_mapping contains negatives.")
+                    layerwise_mapping_tensor[layer_name] = layer_tensor
+                print("Per-layer lora mapping entries:", len(layerwise_mapping_tensor) - 1)
 
                 _ = check_adapter_compatibility(module_list)
                 peft_model = load_peft_model(module_list, base_model)
@@ -564,7 +657,7 @@ def eval_datasets(
                             do_sample=False,
                             temperature=1.0,
                             merging_type=composition_method,
-                            lora_mapping=mapping_matrix_tensor,
+                            lora_mapping=layerwise_mapping_tensor,
                         )
                     except Exception as e:
                         print(f"exception ({composition_method})", e)

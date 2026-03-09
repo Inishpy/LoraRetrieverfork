@@ -641,6 +641,7 @@ class Linear(nn.Module, LoraLayer):
                         )
 
             else: 
+                scalings = []
                 for active_adapter in self.active_adapters:
                     if active_adapter not in self.lora_A.keys():
                         continue
@@ -652,6 +653,10 @@ class Linear(nn.Module, LoraLayer):
                     stacked_lora_B.append(lora_B_weight)
 
                     scaling = self.scaling[active_adapter]
+                    scalings.append(scaling)
+
+                if not stacked_lora_A:
+                    return result.to(torch_result_dtype)
 
                 # 堆叠成最终的矩阵
                 stacked_lora_A = torch.stack(stacked_lora_A, dim=0)  # p x r x d
@@ -659,6 +664,32 @@ class Linear(nn.Module, LoraLayer):
 
                 stacked_lora_A = stacked_lora_A.to(x.dtype)
                 stacked_lora_B = stacked_lora_B.to(x.dtype)
+                if lora_mapping is None:
+                    raise ValueError(
+                        "merging_type requires `lora_mapping`, but got None."
+                    )
+                if isinstance(lora_mapping, dict):
+                    raise ValueError(
+                        "Layer received unresolved dict-style `lora_mapping`; this should be a tensor."
+                    )
+                if not torch.is_tensor(lora_mapping):
+                    raise ValueError(
+                        f"`lora_mapping` must be a tensor, got {type(lora_mapping)}."
+                    )
+                if lora_mapping.ndim != 2:
+                    raise ValueError(
+                        f"`lora_mapping` must have shape [batch, num_adapters], got {tuple(lora_mapping.shape)}."
+                    )
+                if lora_mapping.shape[0] != x.shape[0]:
+                    raise ValueError(
+                        f"`lora_mapping` batch size ({lora_mapping.shape[0]}) != input batch size ({x.shape[0]})."
+                    )
+                if lora_mapping.shape[1] != stacked_lora_A.shape[0]:
+                    raise ValueError(
+                        f"`lora_mapping` adapter width ({lora_mapping.shape[1]}) != active adapters ({stacked_lora_A.shape[0]})."
+                    )
+                lora_mapping = lora_mapping.to(device=x.device, dtype=x.dtype)
+                scaling = scalings[0] if scalings else 1.0
 
                 if merging_type == 'fusion':
                     fusion_lora_A = torch.einsum('bp,prd->brd', lora_mapping, stacked_lora_A)

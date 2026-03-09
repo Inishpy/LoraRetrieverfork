@@ -55,6 +55,47 @@ from .layer import Conv2d, LoraLayer, dispatch_default
 from .torchao import dispatch_torchao
 from .tp_layer import dispatch_megatron
 
+def _candidate_layer_mapping_keys(module_key: Optional[str]) -> list[str]:
+    if not module_key:
+        return []
+
+    keys: list[str] = []
+
+    def add_key(key: str):
+        if key and key not in keys:
+            keys.append(key)
+
+    add_key(module_key)
+
+    stripped = module_key
+    while stripped.startswith("base_model.model."):
+        stripped = stripped[len("base_model.model.") :]
+        add_key(stripped)
+    while stripped.startswith("model."):
+        stripped = stripped[len("model.") :]
+        add_key(stripped)
+
+    current = list(keys)
+    for key in current:
+        if not key.startswith("model."):
+            add_key(f"model.{key}")
+        if not key.startswith("base_model.model."):
+            add_key(f"base_model.model.{key}")
+
+    return keys
+
+
+def _resolve_layerwise_mapping_for_target(target, lora_mapping):
+    if not isinstance(lora_mapping, dict):
+        return lora_mapping
+
+    module_key = getattr(target, "_lora_module_key", None)
+    for key in _candidate_layer_mapping_keys(module_key):
+        if key in lora_mapping:
+            return lora_mapping[key]
+    return lora_mapping.get("__default__", None)
+
+
 def _pre_forward_hook(target, args, kwargs, adapter_names, merging_type, lora_mapping):
     # 仅在存在时将参数注入到 kwargs 中
     if adapter_names is not None:
@@ -62,7 +103,9 @@ def _pre_forward_hook(target, args, kwargs, adapter_names, merging_type, lora_ma
     if merging_type is not None:
         kwargs["merging_type"] = merging_type  # 将新的参数 merging_type 注入
     if lora_mapping is not None:
-        kwargs["lora_mapping"] = lora_mapping  # 将新的参数 lora_mapping 注入
+        resolved_mapping = _resolve_layerwise_mapping_for_target(target, lora_mapping)
+        if resolved_mapping is not None:
+            kwargs["lora_mapping"] = resolved_mapping  # 将新的参数 lora_mapping 注入
     return args, kwargs
 
 
@@ -225,6 +268,7 @@ class LoraModel(BaseTuner):
         from peft.tuners.adalora import AdaLoraLayer
 
         if isinstance(target, LoraLayer) and not isinstance(target, AdaLoraLayer):
+            target._lora_module_key = current_key
             target.update_layer(
                 adapter_name,
                 r,
@@ -237,6 +281,8 @@ class LoraModel(BaseTuner):
             )
         else:
             new_module = self._create_new_module(lora_config, adapter_name, target, **kwargs)
+            if isinstance(new_module, LoraLayer):
+                new_module._lora_module_key = current_key
             if adapter_name not in self.active_adapters:
                 # adding an additional adapter: it is not automatically trainable
                 new_module.requires_grad_(False)
