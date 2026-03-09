@@ -689,6 +689,23 @@ class Linear(nn.Module, LoraLayer):
                         f"`lora_mapping` adapter width ({lora_mapping.shape[1]}) != active adapters ({stacked_lora_A.shape[0]})."
                     )
                 lora_mapping = lora_mapping.to(device=x.device, dtype=x.dtype)
+
+                # Skip adapter columns that are zero for the whole batch at this layer.
+                active_mask = lora_mapping.abs().amax(dim=0) > 1e-8
+                if active_mask.ndim != 1:
+                    raise ValueError(f"Invalid active_mask shape: {tuple(active_mask.shape)}")
+                if not torch.any(active_mask):
+                    # Keep one column to preserve shape invariants; result will be effectively no-op.
+                    fallback_idx = int(torch.argmax(lora_mapping.abs().sum(dim=0)).item())
+                    active_mask = torch.zeros_like(active_mask, dtype=torch.bool)
+                    active_mask[fallback_idx] = True
+                if int(active_mask.sum().item()) < lora_mapping.shape[1]:
+                    lora_mapping = lora_mapping[:, active_mask]
+                    stacked_lora_A = stacked_lora_A[active_mask]
+                    stacked_lora_B = stacked_lora_B[active_mask]
+                    keep_list = active_mask.detach().cpu().tolist()
+                    scalings = [s for s, keep in zip(scalings, keep_list) if keep]
+
                 scaling = scalings[0] if scalings else 1.0
 
                 if merging_type == 'fusion':

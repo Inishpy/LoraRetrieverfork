@@ -390,6 +390,106 @@ def _resolve_eval_types(eval_type="fusion", eval_types=None):
     return ordered
 
 
+def _normalize_rows_with_fallback(matrix, fallback_matrix=None, eps=1e-12):
+    """Row-normalize non-negative matrix; rows with zero sum fall back to provided rows."""
+    mat = np.asarray(matrix, dtype=np.float32).copy()
+    if mat.ndim != 2:
+        raise ValueError(f"Expected 2D matrix, got shape {mat.shape}")
+    mat = np.clip(mat, 0.0, None)
+
+    row_sums = mat.sum(axis=1, keepdims=True)
+    zero_rows = row_sums[:, 0] <= eps
+    if np.any(zero_rows):
+        if fallback_matrix is not None:
+            fb = np.asarray(fallback_matrix, dtype=np.float32)
+            if fb.shape != mat.shape:
+                raise ValueError(
+                    f"Fallback matrix shape {fb.shape} must match matrix shape {mat.shape}."
+                )
+            mat[zero_rows] = np.clip(fb[zero_rows], 0.0, None)
+        else:
+            if mat.shape[1] <= 0:
+                raise ValueError("Cannot normalize matrix with zero columns.")
+            mat[zero_rows] = 1.0 / mat.shape[1]
+        row_sums = mat.sum(axis=1, keepdims=True)
+
+    return mat / np.clip(row_sums, eps, None)
+
+
+def _prune_adapter_mappings(
+    module_list,
+    mapping_matrix,
+    layerwise_mapping_matrix,
+    weight_prune_eps=0.0,
+    mass_prune_eps=1e-8,
+    max_adapters_to_load=None,
+):
+    """
+    Prune low-impact adapters before loading to reduce memory/latency.
+
+    - weight_prune_eps: zero-out per-entry weights below this threshold before renormalization.
+    - mass_prune_eps: drop adapters whose total mass across (global + all layers + all rows) is below this.
+    - max_adapters_to_load: optional hard cap on loaded adapters based on aggregate mass.
+    """
+    if not module_list:
+        raise ValueError("module_list is empty; retrieval returned no adapters.")
+
+    global_map = np.asarray(mapping_matrix, dtype=np.float32)
+    if global_map.ndim != 2 or global_map.shape[1] != len(module_list):
+        raise ValueError(
+            f"Invalid mapping_matrix shape {global_map.shape} for {len(module_list)} adapters."
+        )
+    if weight_prune_eps > 0:
+        global_map[np.abs(global_map) < weight_prune_eps] = 0.0
+    global_map = _normalize_rows_with_fallback(global_map)
+
+    normalized_layers = {}
+    for layer_name, layer_matrix in layerwise_mapping_matrix.items():
+        arr = np.asarray(layer_matrix, dtype=np.float32)
+        if arr.shape != global_map.shape:
+            raise ValueError(
+                f"Layer {layer_name} shape {arr.shape} does not match global mapping shape {global_map.shape}."
+            )
+        if weight_prune_eps > 0:
+            arr[np.abs(arr) < weight_prune_eps] = 0.0
+        normalized_layers[layer_name] = _normalize_rows_with_fallback(arr, fallback_matrix=global_map)
+
+    adapter_mass = global_map.sum(axis=0)
+    for arr in normalized_layers.values():
+        adapter_mass += arr.sum(axis=0)
+
+    keep_idx = np.where(adapter_mass > float(mass_prune_eps))[0]
+    if keep_idx.size == 0:
+        keep_idx = np.asarray([int(np.argmax(adapter_mass))], dtype=np.int64)
+
+    if (
+        max_adapters_to_load is not None
+        and int(max_adapters_to_load) > 0
+        and keep_idx.size > int(max_adapters_to_load)
+    ):
+        keep_count = int(max_adapters_to_load)
+        keep_idx = keep_idx[np.argsort(adapter_mass[keep_idx])[::-1][:keep_count]]
+
+    keep_idx = keep_idx.astype(np.int64)
+    pruned_module_list = [module_list[int(i)] for i in keep_idx]
+
+    pruned_global_map = _normalize_rows_with_fallback(global_map[:, keep_idx])
+    pruned_layer_maps = {
+        layer_name: _normalize_rows_with_fallback(arr[:, keep_idx], fallback_matrix=pruned_global_map)
+        for layer_name, arr in normalized_layers.items()
+    }
+
+    kept = len(pruned_module_list)
+    removed = len(module_list) - kept
+    prune_stats = {"original": len(module_list), "kept": kept, "removed": removed}
+    return (
+        pruned_module_list,
+        pruned_global_map.astype(np.float32),
+        {k: v.astype(np.float32) for k, v in pruned_layer_maps.items()},
+        prune_stats,
+    )
+
+
 def init_vector_db(config_path="./config/config2.json"):
     """
     Initialize the vector database with configurations from the specified JSON file.
@@ -497,8 +597,11 @@ def eval_datasets(
     best_selection=False,
     model_size="7b",
     seed=None,
-    layer_top_k=1,
+    layer_top_k=3,
     eval_types=None,
+    weight_prune_eps=1e-6,
+    mass_prune_eps=1e-6,
+    max_adapters_to_load=None,
 ):
     """
     Evaluate the model on given datasets.
@@ -514,6 +617,9 @@ def eval_datasets(
     - ood: Flag indicating if out-of-domain exclusion should be applied.
     - best_selection: If True, use the most appropriate LoRA for each input.
     - model_size: Model size of Llama-2.
+    - weight_prune_eps: Per-entry threshold; smaller weights are zeroed before renormalization.
+    - mass_prune_eps: Drop adapters with very low total mass across global + layerwise mappings.
+    - max_adapters_to_load: Optional cap on number of adapters loaded per batch.
     """
 
     if seed is not None:
@@ -589,12 +695,32 @@ def eval_datasets(
                         for layer_name in layer_names
                     }
 
+                (
+                    module_list,
+                    mapping_matrix,
+                    layerwise_mapping_matrix,
+                    prune_stats,
+                ) = _prune_adapter_mappings(
+                    module_list=module_list,
+                    mapping_matrix=mapping_matrix,
+                    layerwise_mapping_matrix=layerwise_mapping_matrix,
+                    weight_prune_eps=weight_prune_eps,
+                    mass_prune_eps=mass_prune_eps,
+                    max_adapters_to_load=max_adapters_to_load,
+                )
+                print(
+                    "Adapter prune stats:",
+                    prune_stats,
+                    f"(weight_prune_eps={weight_prune_eps}, mass_prune_eps={mass_prune_eps}, "
+                    f"max_adapters_to_load={max_adapters_to_load})",
+                )
+
                 print("module_list:", module_list)
                 if mapping_matrix is None:
                     raise ValueError(
                         "mapping_matrix is None. Retrieval may have failed or returned no adapters."
                     )
-                mapping_matrix_tensor = torch.tensor(mapping_matrix).to(device)
+                mapping_matrix_tensor = torch.tensor(mapping_matrix, dtype=torch.float32).to(device)
                 print("mapping_matrix_tensor.shape:", mapping_matrix_tensor.shape)
                 print("Number of adapters loaded:", len(module_list))
                 if mapping_matrix_tensor.shape[1] != len(module_list):
@@ -619,7 +745,7 @@ def eval_datasets(
                     )
                 layerwise_mapping_tensor = {"__default__": mapping_matrix_tensor}
                 for layer_name, layer_matrix in layerwise_mapping_matrix.items():
-                    layer_tensor = torch.tensor(layer_matrix).to(device)
+                    layer_tensor = torch.tensor(layer_matrix, dtype=torch.float32).to(device)
                     if layer_tensor.shape[1] != len(module_list):
                         raise ValueError(
                             f"Layer {layer_name} shape mismatch: mapping width ({layer_tensor.shape[1]}) "
