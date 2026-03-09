@@ -236,6 +236,10 @@ def eval_datasets(
                     raise ValueError(f"Shape mismatch: mapping_matrix_tensor.shape[1] ({mapping_matrix_tensor.shape[1]}) != number of adapters ({len(module_list)}). Please check retrieval logic.")
                 mapping_matrix_tensor = mapping_matrix_tensor.to(torch.bfloat16)
                 mapping_matrix_tensor /= lora_num
+                if not torch.isfinite(mapping_matrix_tensor).all():
+                    raise ValueError("lora_mapping contains NaN/inf values; check retrieval/mapping normalization.")
+                if (mapping_matrix_tensor < 0).any():
+                    raise ValueError("lora_mapping contains negative values; check retrieval/mapping normalization.")
                 
                 configs = check_adapter_compatibility(module_list)
                 # Load the PEFT model with selected adapters
@@ -256,9 +260,10 @@ def eval_datasets(
                     outputs = peft_model.generate(
                         input_ids=inputs["input_ids"],
                         max_new_tokens=50,
-                        temperature=0.001,
+                        do_sample=False,
+                        temperature=1.0,
                         merging_type=eval_type,
-                        lora_mapping=mapping_matrix_tensor
+                        lora_mapping=mapping_matrix_tensor,
                         # module_list=module_list  # Ensure adapter stacking order matches mapping matrix
                     )
                 except Exception as e:
