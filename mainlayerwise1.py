@@ -515,15 +515,23 @@ def load_peft_model(lora_module_list, base_model):
         print(f"Adapter config: {peft_model.peft_config[f'adapter{i}']}")
 
     print(f"\nSetting adapters: {lora_lists}")
-    peft_model.set_adapter(lora_lists)
+    # Important: multi-adapter activation must go through base_model on PeftModel.
+    # Using peft_model.set_adapter(list) can leave only one adapter active in layers.
+    peft_model.base_model.set_adapter(lora_lists)
 
     print(f"Active adapters after set_adapter: {peft_model.active_adapters}")
+    if len(peft_model.active_adapters) != len(lora_lists):
+        raise RuntimeError(
+            f"Adapter activation mismatch: requested {len(lora_lists)} adapters "
+            f"but model reports {len(peft_model.active_adapters)} active. "
+            "This will break lora_mapping width checks."
+        )
 
     for name, module in peft_model.named_modules():
         if "q_proj" in name and hasattr(module, "lora_A"):
             print(f"\n{name}:")
             print(f"  lora_A type: {type(module.lora_A)}")
-            if isinstance(module.lora_A, dict):
+            if hasattr(module.lora_A, "keys"):
                 print(f"  Keys in lora_A: {module.lora_A.keys()}")
                 for key in module.lora_A.keys():
                     if module.lora_A[key] is not None:
@@ -597,7 +605,7 @@ def eval_datasets(
     best_selection=False,
     model_size="7b",
     seed=None,
-    layer_top_k=3,
+    layer_top_k=1,
     eval_types=None,
     weight_prune_eps=1e-6,
     mass_prune_eps=1e-6,
@@ -654,6 +662,7 @@ def eval_datasets(
     base_model, tokenizer = load_base_model(model_path)
     base_model.eval()
 
+    skipped_empty_retrieval = 0
     with torch.no_grad():
         with tqdm(total=len(dataset["train"]), desc="Evaluating", unit="item") as pbar:
             for i in range(0, len(eval_data["full_prompt"]), batch_size):
@@ -675,6 +684,15 @@ def eval_datasets(
                     return_details=True,
                     return_layerwise_mapping=True,
                 )
+                if len(module_list) == 0:
+                    skipped_empty_retrieval += len(input_text)
+                    print(
+                        f"[skip-empty-retrieval] sample_idx={i}, "
+                        f"domain={eval_data['domain'][i]}, task={eval_data['task'][i]}, "
+                        f"ood={ood}, exclude={exclude_list}"
+                    )
+                    pbar.update(len(input_text))
+                    continue
                 input_text = eval_data["full_prompt"][i : i + batch_size]
 
                 if best_selection:
@@ -786,7 +804,11 @@ def eval_datasets(
                             lora_mapping=layerwise_mapping_tensor,
                         )
                     except Exception as e:
-                        print(f"exception ({composition_method})", e)
+                        print(
+                            f"exception ({composition_method}) at sample_idx={i}, "
+                            f"domain={eval_data['domain'][i]}, task={eval_data['task'][i]}, "
+                            f"adapters={len(module_list)}, global_map_shape={tuple(mapping_matrix_tensor.shape)}: {e}"
+                        )
                         continue
 
                     for j, (output, expected_answer) in enumerate(
@@ -811,12 +833,14 @@ def eval_datasets(
                             f"[{composition_method}] generated_answer: {generated_answer}, expected_answer: {expected_answer}"
                         )
 
+                pbar.update(len(input_text))
                 pbar.set_description("Evaluating")
                 peft_model.unload()
 
     os.makedirs(os.path.dirname(res_path), exist_ok=True)
     with open(res_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=4)
+    print(f"Skipped samples due to empty retrieval: {skipped_empty_retrieval}")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 import os
 import json
+import argparse
 from collections import defaultdict
 from datetime import datetime
 from nltk.translate.bleu_score import sentence_bleu
@@ -132,9 +133,40 @@ def convert_to_latex_mean_std(data, result_files):
 
     return df.to_latex(index=False)
 
-# Example usage
-base_results_folder = 'results'
-folder_path = get_latest_timestamp_results_dir(base_results_folder)
-processed_data, result_files = process_seeds_folder(folder_path)
-latex_table = convert_to_latex_mean_std(processed_data, result_files)
-print(latex_table)
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Summarize seed results. If --seeds-folder is provided, it is used directly. "
+            "Otherwise, the most recent timestamped folder under --base-results-folder is used."
+        )
+    )
+    parser.add_argument(
+        "--seeds-folder",
+        type=str,
+        default=None,
+        help="Path to folder containing seed* subfolders. Overrides timestamp lookup.",
+    )
+    parser.add_argument(
+        "--base-results-folder",
+        type=str,
+        default="results",
+        help="Base folder containing timestamped result directories (default: results).",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    if args.seeds_folder:
+        folder_path = args.seeds_folder
+    else:
+        folder_path = get_latest_timestamp_results_dir(args.base_results_folder)
+
+    processed_data, result_files = process_seeds_folder(folder_path)
+    latex_table = convert_to_latex_mean_std(processed_data, result_files)
+    print(latex_table)
+
+
+if __name__ == "__main__":
+    main()
