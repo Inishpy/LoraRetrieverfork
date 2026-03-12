@@ -1,3 +1,30 @@
+## Why You Need Both
+"""
+They answer two different questions:
+
+| Parameter | Question it answers |
+|---|---|
+| `layer_top_k` | How **wide** is the search per layer? (exploration) |
+| `lora_num` | How many adapters do we actually **load**? (budget) |
+
+Consider this scenario with `layer_top_k=3` and `lora_num=2`:
+```
+Layer 0  → [AdapterA, AdapterB, AdapterC]
+Layer 1  → [AdapterA, AdapterD, AdapterB]
+Layer 2  → [AdapterE, AdapterA, AdapterB]
+
+After score aggregation:
+  AdapterA = 8.7  (won in all 3 layers)
+  AdapterB = 5.2  (appeared in all 3 layers)
+  AdapterC = 1.1  (only layer 0)
+  AdapterD = 0.9  (only layer 1)
+  AdapterE = 0.8  (only layer 2)
+
+lora_num=2 → final selection: [AdapterA, AdapterB]
+
+"""
+
+
 import json
 import os
 import random
@@ -33,7 +60,7 @@ SUPPORTED_COMPOSITION_METHODS = ["fusion", "mixture"]
 
 
 def load_base_model(model_name_or_path="meta-llama/Llama-2-7b-hf"):
-    """
+    """ 
     Load the base model and tokenizer from a given model path.
     """
     tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
@@ -192,21 +219,55 @@ def initialize_index(models, model_size="7b", blend=0.35):
     )
 
 
-def _retrieve_topk_per_layer(query_text, layerwise_index, layer_k=1):
+def _retrieve_topk_per_layer(
+    query_text,
+    layerwise_index,
+    layer_k=1,
+    exclude_item=None,
+    query_idx=None,
+    debug=False,
+):
     q = _encode_with_instruction([query_text])[0].astype(np.float32)
     q = q / (np.linalg.norm(q) + 1e-12)
 
     hits = {}
     for layer_name, bucket in layerwise_index.items():
-        sims = cosine_similarity(q[None, :], bucket["matrix"])[0]
-        top_idx = np.argsort(sims)[::-1][:layer_k]
+        total_candidates = len(bucket["lora_paths"])
+        valid_idx = list(range(total_candidates))
+        if exclude_item is not None:
+            valid_idx = [
+                idx for idx, path in enumerate(bucket["lora_paths"]) if path != exclude_item
+            ]
+
+        if len(valid_idx) == 0:
+            hits[layer_name] = []
+            if debug:
+                print(
+                    "[retrieve-debug-layer] "
+                    f"query_idx={query_idx}, layer={layer_name}, "
+                    f"total_candidates={total_candidates}, post_exclude_candidates=0, "
+                    f"exclude_item={exclude_item}"
+                )
+            continue
+
+        sims = cosine_similarity(q[None, :], bucket["matrix"][valid_idx])[0]
+        top_local_idx = np.argsort(sims)[::-1][:layer_k]
+        top_idx = [valid_idx[int(idx)] for idx in top_local_idx]
         hits[layer_name] = [
             {
                 "lora_path": bucket["lora_paths"][int(idx)],
-                "score": float(sims[int(idx)]),
+                "score": float(sims[int(local_idx)]),
             }
-            for idx in top_idx
+            for local_idx, idx in zip(top_local_idx, top_idx)
         ]
+        if debug:
+            print(
+                "[retrieve-debug-layer] "
+                f"query_idx={query_idx}, layer={layer_name}, "
+                f"total_candidates={total_candidates}, post_exclude_candidates={len(valid_idx)}, "
+                f"requested_top_k={layer_k}, returned_hits={len(hits[layer_name])}, "
+                f"exclude_item={exclude_item}"
+            )
     return hits
 
 
@@ -238,9 +299,10 @@ def perform_search(
     query_list,
     k=20,
     exclude_list=None,
-    layer_top_k=1,
+    layer_top_k=3,
     return_details=False,
     return_layerwise_mapping=False,
+    debug=False,
 ):
     """
     Layer-wise retrieval entrypoint compatible with original API.
@@ -257,11 +319,32 @@ def perform_search(
     weights_per_query = []
     layerwise_weights_per_query = []
     retrieval_details = []
+    total_layers = len(global_layerwise_index) if global_layerwise_index else 0
+    if global_layerwise_index:
+        total_entries = sum(len(v["lora_paths"]) for v in global_layerwise_index.values())
+        unique_index_adapters = len(
+            {path for v in global_layerwise_index.values() for path in v["lora_paths"]}
+        )
+    else:
+        total_entries = 0
+        unique_index_adapters = 0
 
     for j, query in enumerate(query_list):
         exclude_item = exclude_list[j] if exclude_list else None
+        if debug:
+            print(
+                "[retrieve-debug-query-start] "
+                f"query_idx={j}, exclude_item={exclude_item}, layer_top_k={layer_top_k}, k={k}, "
+                f"index_layers={total_layers}, index_entries={total_entries}, "
+                f"index_unique_adapters={unique_index_adapters}"
+            )
         layer_hits = _retrieve_topk_per_layer(
-            query, global_layerwise_index, layer_k=layer_top_k
+            query,
+            global_layerwise_index,
+            layer_k=layer_top_k,
+            exclude_item=exclude_item,
+            query_idx=j,
+            debug=debug,
         )
 
         score_by_adapter = defaultdict(float)
@@ -269,12 +352,24 @@ def perform_search(
         for layer_name, per_layer_hits in layer_hits.items():
             for hit in per_layer_hits:
                 adapter = hit["lora_path"]
-                if exclude_item is not None and adapter == exclude_item:
-                    continue
                 score_by_adapter[adapter] += hit["score"]
                 score_by_adapter_per_layer[layer_name][adapter] += hit["score"]
 
         ranked = sorted(score_by_adapter.items(), key=lambda x: x[1], reverse=True)
+        if debug:
+            total_hits = sum(len(v) for v in layer_hits.values())
+            unique_hit_adapters = len(
+                {hit["lora_path"] for per_layer_hits in layer_hits.values() for hit in per_layer_hits}
+            )
+            print(
+                "[retrieve-debug-query-after-layer-topk] "
+                f"query_idx={j}, total_hits={total_hits}, unique_hit_adapters={unique_hit_adapters}, "
+                f"ranked_adapter_count={len(ranked)}"
+            )
+            print(
+                "[retrieve-debug-query-top-ranked] "
+                f"query_idx={j}, top10={[name for name, _ in ranked[:10]]}"
+            )
         ranked_per_layer = {
             layer_name: sorted(layer_scores.items(), key=lambda x: x[1], reverse=True)
             for layer_name, layer_scores in score_by_adapter_per_layer.items()
@@ -286,10 +381,21 @@ def perform_search(
         chosen_set = set()
         for layer_selected in layerwise_selected_adapters.values():
             chosen_set.update(layer_selected)
-        if not chosen_set:
+        if not chosen_set and ranked:
             chosen_set.update([name for name, _ in ranked[:k]])
         chosen = sorted(chosen_set, key=lambda name: float(score_by_adapter.get(name, 0.0)), reverse=True)
         chosen_weights = _scores_to_normalized_weights(score_by_adapter, chosen)
+        if debug:
+            print(
+                "[retrieve-debug-query-selected] "
+                f"query_idx={j}, selected_count={len(chosen)}, selected_top10={chosen[:10]}"
+            )
+            if not chosen:
+                print(
+                    "[retrieve-debug-query-empty] "
+                    f"query_idx={j}, exclude_item={exclude_item}, "
+                    "No adapters remained after pre-filter + per-layer top-k."
+                )
 
         layerwise_weight_map = {}
         for layer_name in layer_hits.keys():
@@ -490,6 +596,62 @@ def _prune_adapter_mappings(
     )
 
 
+def _has_local_adapter_files(lora_path):
+    """Return True if adapter config + weights are available locally (no network)."""
+    if os.path.isdir(lora_path):
+        has_config = os.path.exists(os.path.join(lora_path, "adapter_config.json"))
+        has_weights = os.path.exists(os.path.join(lora_path, "adapter_model.safetensors")) or os.path.exists(
+            os.path.join(lora_path, "adapter_model.bin")
+        )
+        return has_config and has_weights
+
+    from huggingface_hub import hf_hub_download
+
+    try:
+        hf_hub_download(repo_id=lora_path, filename="adapter_config.json", local_files_only=True)
+    except Exception:
+        return False
+
+    for filename in ("adapter_model.safetensors", "adapter_model.bin"):
+        try:
+            hf_hub_download(repo_id=lora_path, filename=filename, local_files_only=True)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _filter_unavailable_adapters(module_list, mapping_matrix, layerwise_mapping_matrix):
+    """
+    Filter adapters that are not locally available and shrink mapping matrices accordingly.
+    """
+    keep_idx = []
+    dropped = []
+    for idx, adapter in enumerate(module_list):
+        if _has_local_adapter_files(adapter):
+            keep_idx.append(idx)
+        else:
+            dropped.append(adapter)
+
+    if len(keep_idx) == len(module_list):
+        return module_list, mapping_matrix, layerwise_mapping_matrix, dropped
+
+    keep_idx = np.asarray(keep_idx, dtype=np.int64)
+    filtered_modules = [module_list[int(i)] for i in keep_idx]
+
+    global_map = np.asarray(mapping_matrix, dtype=np.float32)
+    filtered_global_map = global_map[:, keep_idx] if keep_idx.size > 0 else np.zeros((global_map.shape[0], 0), dtype=np.float32)
+
+    filtered_layer_maps = {}
+    for layer_name, layer_matrix in layerwise_mapping_matrix.items():
+        layer_arr = np.asarray(layer_matrix, dtype=np.float32)
+        filtered_layer_maps[layer_name] = (
+            layer_arr[:, keep_idx] if keep_idx.size > 0 else np.zeros((layer_arr.shape[0], 0), dtype=np.float32)
+        )
+
+    return filtered_modules, filtered_global_map, filtered_layer_maps, dropped
+
+
 def init_vector_db(config_path="./config/config2.json"):
     """
     Initialize the vector database with configurations from the specified JSON file.
@@ -503,13 +665,25 @@ def init_vector_db(config_path="./config/config2.json"):
 def load_peft_model(lora_module_list, base_model):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     lora_lists = []
+    if isinstance(base_model, PeftModel):
+        # Avoid adapter namespace leakage if caller accidentally passes a wrapped model.
+        base_model = base_model.unload()
 
     for i, lora_model in enumerate(lora_module_list):
         print(f"\nLoading adapter {i}: {lora_model}")
         if i == 0:
-            peft_model = PeftModel.from_pretrained(base_model, lora_model, f"adapter{i}")
+            peft_model = PeftModel.from_pretrained(
+                base_model,
+                lora_model,
+                f"adapter{i}",
+                local_files_only=True,
+            )
         else:
-            peft_model.load_adapter(lora_model, f"adapter{i}")
+            peft_model.load_adapter(
+                lora_model,
+                f"adapter{i}",
+                local_files_only=True,
+            )
         lora_lists.append(f"adapter{i}")
 
         print(f"Adapter config: {peft_model.peft_config[f'adapter{i}']}")
@@ -546,6 +720,78 @@ def load_peft_model(lora_module_list, base_model):
     peft_model = peft_model.to(device)
     peft_model.eval()
     return peft_model
+
+
+def _normalize_mapping_columns(mapping_tensor):
+    row_sums = mapping_tensor.sum(dim=1, keepdim=True)
+    zero_mask = row_sums.squeeze(-1) <= 0
+    if zero_mask.any():
+        # If alignment removed all mass for a row, fall back to a deterministic one-hot.
+        # Prefer the strongest absolute column in that row when possible, otherwise col 0.
+        repaired = mapping_tensor[zero_mask]
+        if repaired.shape[1] == 0:
+            raise ValueError("lora_mapping has zero adapter width after alignment.")
+        fallback_idx = repaired.abs().argmax(dim=1)
+        repaired = torch.zeros_like(repaired)
+        repaired.scatter_(1, fallback_idx.unsqueeze(1), 1.0)
+        mapping_tensor = mapping_tensor.clone()
+        mapping_tensor[zero_mask] = repaired
+        row_sums = mapping_tensor.sum(dim=1, keepdim=True)
+    mapping_tensor = mapping_tensor / row_sums
+    if not torch.isfinite(mapping_tensor).all():
+        raise ValueError("lora_mapping contains NaN/inf after adapter alignment.")
+    if (mapping_tensor < 0).any():
+        raise ValueError("lora_mapping contains negatives after adapter alignment.")
+    return mapping_tensor
+
+
+def _align_mapping_to_consistent_adapters(peft_model, lora_mapping_tensor, layerwise_mapping_tensor):
+    """
+    Some adapters can be missing on a subset of layers. Keep only adapters present on all LoRA layers
+    so every layer sees a consistent mapping width.
+    """
+    expected = [f"adapter{i}" for i in range(lora_mapping_tensor.shape[1])]
+    expected_set = set(expected)
+
+    common_keys = None
+    for _, module in peft_model.named_modules():
+        if not hasattr(module, "lora_A") or not hasattr(module.lora_A, "keys"):
+            continue
+        keys = set(module.lora_A.keys()) & expected_set
+        if common_keys is None:
+            common_keys = set(keys)
+        else:
+            common_keys &= keys
+
+    if common_keys is None:
+        return peft_model, lora_mapping_tensor, layerwise_mapping_tensor
+
+    aligned_adapters = [name for name in expected if name in common_keys]
+    if len(aligned_adapters) == 0:
+        raise RuntimeError("No common adapters found across LoRA layers after loading.")
+
+    if len(aligned_adapters) == len(expected):
+        return peft_model, lora_mapping_tensor, layerwise_mapping_tensor
+
+    keep_idx = torch.tensor([expected.index(name) for name in aligned_adapters], device=lora_mapping_tensor.device)
+    print(
+        "[adapter-alignment] "
+        f"requested={len(expected)}, consistent_across_layers={len(aligned_adapters)}, "
+        f"kept={aligned_adapters}"
+    )
+
+    lora_mapping_tensor = lora_mapping_tensor.index_select(dim=1, index=keep_idx)
+    lora_mapping_tensor = _normalize_mapping_columns(lora_mapping_tensor)
+    lora_mapping_tensor = lora_mapping_tensor.to(torch.bfloat16)
+
+    aligned_layerwise = {}
+    for layer_name, layer_tensor in layerwise_mapping_tensor.items():
+        aligned_tensor = layer_tensor.index_select(dim=1, index=keep_idx)
+        aligned_tensor = _normalize_mapping_columns(aligned_tensor)
+        aligned_layerwise[layer_name] = aligned_tensor.to(torch.bfloat16)
+
+    peft_model.base_model.set_adapter(aligned_adapters)
+    return peft_model, lora_mapping_tensor, aligned_layerwise
 
 
 def check_adapter_compatibility(lora_module_list):
@@ -605,11 +851,12 @@ def eval_datasets(
     best_selection=False,
     model_size="7b",
     seed=None,
-    layer_top_k=1,
+    layer_top_k=3,
     eval_types=None,
     weight_prune_eps=1e-6,
     mass_prune_eps=1e-6,
     max_adapters_to_load=None,
+    retrieval_debug=True,
 ):
     """
     Evaluate the model on given datasets.
@@ -628,6 +875,7 @@ def eval_datasets(
     - weight_prune_eps: Per-entry threshold; smaller weights are zeroed before renormalization.
     - mass_prune_eps: Drop adapters with very low total mass across global + layerwise mappings.
     - max_adapters_to_load: Optional cap on number of adapters loaded per batch.
+    - retrieval_debug: Print detailed retrieval diagnostics per query/layer.
     """
 
     if seed is not None:
@@ -656,6 +904,10 @@ def eval_datasets(
     else:
         dataset = load_dataset(data_path)
 
+    # dataset["train"] = dataset["train"].filter(
+    #     lambda data_point: data_point.get("metric") != "rouge"
+    # )
+    print(dataset["train"][:10])
     eval_data = dataset["train"].map(generate_and_tokenize_prompt)
 
     model_path = f"meta-llama/Llama-2-{model_size}-hf"
@@ -683,7 +935,14 @@ def eval_datasets(
                     layer_top_k=layer_top_k,
                     return_details=True,
                     return_layerwise_mapping=True,
+                    debug=retrieval_debug,
                 )
+                if retrieval_debug:
+                    print(
+                        "[retrieve-debug-batch-summary] "
+                        f"batch_start={i}, batch_size={len(input_text)}, "
+                        f"exclude_list={exclude_list}, module_count={len(module_list)}"
+                    )
                 if len(module_list) == 0:
                     skipped_empty_retrieval += len(input_text)
                     print(
@@ -732,6 +991,30 @@ def eval_datasets(
                     f"(weight_prune_eps={weight_prune_eps}, mass_prune_eps={mass_prune_eps}, "
                     f"max_adapters_to_load={max_adapters_to_load})",
                 )
+                (
+                    module_list,
+                    mapping_matrix,
+                    layerwise_mapping_matrix,
+                    unavailable_adapters,
+                ) = _filter_unavailable_adapters(
+                    module_list=module_list,
+                    mapping_matrix=mapping_matrix,
+                    layerwise_mapping_matrix=layerwise_mapping_matrix,
+                )
+                if unavailable_adapters:
+                    print(
+                        "[adapter-local-cache-filter] "
+                        f"removed={len(unavailable_adapters)} adapters not found locally: "
+                        f"{unavailable_adapters}"
+                    )
+                if len(module_list) == 0:
+                    skipped_empty_retrieval += len(input_text)
+                    print(
+                        f"[skip-no-local-adapters] sample_idx={i}, "
+                        f"domain={eval_data['domain'][i]}, task={eval_data['task'][i]}"
+                    )
+                    pbar.update(len(input_text))
+                    continue
 
                 print("module_list:", module_list)
                 if mapping_matrix is None:
@@ -785,6 +1068,11 @@ def eval_datasets(
 
                 _ = check_adapter_compatibility(module_list)
                 peft_model = load_peft_model(module_list, base_model)
+                peft_model, mapping_matrix_tensor, layerwise_mapping_tensor = _align_mapping_to_consistent_adapters(
+                    peft_model=peft_model,
+                    lora_mapping_tensor=mapping_matrix_tensor,
+                    layerwise_mapping_tensor=layerwise_mapping_tensor,
+                )
 
                 inputs = tokenizer(
                     input_text,
@@ -835,7 +1123,9 @@ def eval_datasets(
 
                 pbar.update(len(input_text))
                 pbar.set_description("Evaluating")
-                peft_model.unload()
+                # Keep base_model clean between batches; unload() returns the reset base model.
+                base_model = peft_model.unload()
+                base_model.eval()
 
     os.makedirs(os.path.dirname(res_path), exist_ok=True)
     with open(res_path, "w", encoding="utf-8") as f:
