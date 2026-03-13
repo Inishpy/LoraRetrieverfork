@@ -15,7 +15,8 @@ pythondef build_franken_lora(base_model, layerwise_best_adapters):
         # Inject directly: W_new = W_base + ΔW_best_for_this_layer
         layer.q_proj.weight.data += delta_w["q_proj"]
         layer.v_proj.weight.data += delta_w["v_proj"]
-Now layer 0 literally has AdapterA's matrices baked in, layer 1 has AdapterC's, and so on — no blending overhead at inference time."""
+Now layer 0 literally has AdapterA's matrices baked in, layer 1 has AdapterC's, and so on — no blending overhead at inference time.
+"""
 
 
 
@@ -347,6 +348,175 @@ def _apply_layerwise_weight_surgery(
     }
 
 
+def _prepare_layerwise_sample_weights(
+    module_list,
+    layerwise_mapping_matrix,
+    sample_idx,
+    weight_eps=1e-8,
+    layer_active_k=None,
+):
+    """Return normalized per-layer adapter weights for one sample."""
+    if not module_list:
+        return {}
+
+    if sample_idx < 0:
+        raise ValueError(f"sample_idx must be non-negative, got {sample_idx}")
+
+    k = None
+    if layer_active_k is not None and int(layer_active_k) > 0:
+        k = int(layer_active_k)
+
+    layer_weights = {}
+    for layer_name, layer_rows in layerwise_mapping_matrix.items():
+        arr = np.asarray(layer_rows, dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[1] != len(module_list):
+            raise ValueError(
+                f"Layer {layer_name} expected shape [batch, {len(module_list)}], got {arr.shape}"
+            )
+        if sample_idx >= arr.shape[0]:
+            continue
+
+        weights = np.clip(arr[sample_idx], 0.0, None)
+        if k is not None and weights.size > k:
+            top_idx = np.argsort(weights)[::-1][:k]
+            sparse = np.zeros_like(weights)
+            sparse[top_idx] = weights[top_idx]
+            weights = sparse
+
+        total = float(weights.sum())
+        if total <= weight_eps:
+            continue
+        layer_weights[layer_name] = weights / total
+
+    return layer_weights
+
+
+def _apply_layerwise_output_mixture(
+    base_model,
+    module_list,
+    layerwise_mapping_matrix,
+    sample_idx,
+    input_ids,
+    attention_mask=None,
+    max_new_tokens=50,
+    do_sample=False,
+    temperature=1.0,
+    weight_eps=1e-8,
+    layer_active_k=None,
+):
+    """
+    Layer-wise mixture without mutating base weights.
+    For each targeted layer output: y = y_base + sum_i w_i * scaling_i * (x @ A_i^T @ B_i^T).
+    """
+    if not module_list:
+        raise ValueError("module_list is empty; cannot run layerwise output mixture.")
+
+    named_modules = dict(base_model.named_modules())
+    layer_weights = _prepare_layerwise_sample_weights(
+        module_list=module_list,
+        layerwise_mapping_matrix=layerwise_mapping_matrix,
+        sample_idx=sample_idx,
+        weight_eps=weight_eps,
+        layer_active_k=layer_active_k,
+    )
+
+    handles = []
+    layers_touched = 0
+    updates_applied = 0
+    missing_module_layers = set()
+    skipped_shape_mismatches = 0
+
+    for layer_name, weights in layer_weights.items():
+        module = None
+        for key in _candidate_layer_mapping_keys(layer_name):
+            module = named_modules.get(key)
+            if module is not None:
+                break
+        if module is None:
+            missing_module_layers.add(layer_name)
+            continue
+        if not hasattr(module, "weight") or module.weight is None or module.weight.ndim != 2:
+            missing_module_layers.add(layer_name)
+            continue
+
+        out_features, in_features = module.weight.shape
+        entries = []
+        for adapter_idx, adapter_weight in enumerate(weights):
+            adapter_weight = float(adapter_weight)
+            if abs(adapter_weight) <= weight_eps:
+                continue
+
+            adapter_path = module_list[adapter_idx]
+            adapter_factors = _get_layer_lora_factors_cached(adapter_path)
+            factors = _resolve_adapter_layer_factors(adapter_factors, layer_name)
+            if factors is None:
+                continue
+
+            A_cpu = factors["A"]
+            B_cpu = factors["B"]
+            if (
+                A_cpu.ndim != 2
+                or B_cpu.ndim != 2
+                or B_cpu.shape[1] != A_cpu.shape[0]
+                or B_cpu.shape[0] != out_features
+                or A_cpu.shape[1] != in_features
+            ):
+                skipped_shape_mismatches += 1
+                continue
+
+            coeff = float(adapter_weight * factors["scaling"])
+            A = A_cpu.to(device=module.weight.device, dtype=module.weight.dtype)
+            B = B_cpu.to(device=module.weight.device, dtype=module.weight.dtype)
+            entries.append((coeff, A, B))
+            updates_applied += 1
+
+        if not entries:
+            continue
+
+        def make_mixture_hook(local_entries):
+            def _mixture_hook(_module, hook_inputs, hook_output):
+                if not hook_inputs:
+                    return hook_output
+                x = hook_inputs[0]
+                if not torch.is_tensor(x):
+                    return hook_output
+
+                delta = None
+                for coeff, A, B in local_entries:
+                    contrib = torch.matmul(torch.matmul(x, A.transpose(0, 1)), B.transpose(0, 1))
+                    if coeff != 1.0:
+                        contrib = contrib * coeff
+                    delta = contrib if delta is None else delta + contrib
+
+                if delta is None:
+                    return hook_output
+                return hook_output + delta.to(dtype=hook_output.dtype)
+
+            return _mixture_hook
+
+        handles.append(module.register_forward_hook(make_mixture_hook(entries)))
+        layers_touched += 1
+
+    try:
+        outputs = base_model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+        )
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    return outputs, {
+        "layers_touched": layers_touched,
+        "updates_applied": updates_applied,
+        "missing_module_layers": len(missing_module_layers),
+        "skipped_shape_mismatches": skipped_shape_mismatches,
+    }
+
+
 def _delta_to_fixed_embedding(delta_w, emb_dim=768):
     """Convert variable-size delta matrix into fixed-size vector via adaptive pooling."""
     flat = delta_w.reshape(-1)
@@ -358,7 +528,7 @@ def _delta_to_fixed_embedding(delta_w, emb_dim=768):
     return v.numpy().astype(np.float32)
 
 
-def build_layerwise_lora_index(lora_index, emb_dim=768, blend=0.35):
+def build_layerwise_lora_index(lora_index, emb_dim=768, blend=0.5):
     """
     Build layer-wise index from per-task embeddings + per-layer LoRA signatures.
     """
@@ -394,7 +564,7 @@ def build_layerwise_lora_index(lora_index, emb_dim=768, blend=0.35):
     return layerwise_index
 
 
-def initialize_index(models, model_size="7b", blend=0.35):
+def initialize_index(models, model_size="7b", blend=0.5):
     """
     Initialize layer-wise retrieval index.
     Same model/config interface as original initialize_index.
@@ -559,7 +729,7 @@ def perform_search(
             query_idx=j,
             debug=debug,
         )
-
+        #print("layer_hits", layer_hits)
         score_by_adapter = defaultdict(float)
         score_by_adapter_per_layer = defaultdict(lambda: defaultdict(float))
         for layer_name, per_layer_hits in layer_hits.items():
@@ -587,10 +757,12 @@ def perform_search(
             layer_name: sorted(layer_scores.items(), key=lambda x: x[1], reverse=True)
             for layer_name, layer_scores in score_by_adapter_per_layer.items()
         }
+        # print("ranked_per_layer", ranked_per_layer)
         layerwise_selected_adapters = {
             layer_name: [name for name, _ in layer_rank[:k]]
             for layer_name, layer_rank in ranked_per_layer.items()
         }
+        # print("layerwise_selected_adapters", layerwise_selected_adapters)
         chosen_set = set()
         for layer_selected in layerwise_selected_adapters.values():
             chosen_set.update(layer_selected)
@@ -620,12 +792,12 @@ def perform_search(
             layerwise_weight_map[layer_name] = {
                 adapter: weight for adapter, weight in zip(chosen, layer_weights)
             }
-
+        # print("layerwise_weight_map", layerwise_weight_map)
         all_results_set.update(chosen)
         selected_per_query.append(chosen)
         weights_per_query.append(chosen_weights)
         layerwise_weights_per_query.append(layerwise_weight_map)
-
+        # print("layerwise_weights_per_query", layerwise_weights_per_query)
         if return_details:
             retrieval_details.append(
                 {
@@ -929,8 +1101,9 @@ def eval_datasets(
     weight_prune_eps=1e-6,
     mass_prune_eps=1e-6,
     max_adapters_to_load=None,
-    retrieval_debug=True,
+    retrieval_debug=False,
     surgery_layer_top_k=3,
+    surgery_merge_type="fusion",
 ):
     """
     Evaluate the model on given datasets.
@@ -951,6 +1124,7 @@ def eval_datasets(
     - max_adapters_to_load: Optional cap on number of adapters loaded per batch.
     - retrieval_debug: Print detailed retrieval diagnostics per query/layer.
     - surgery_layer_top_k: Optional top-k active adapters per layer for surgery mode.
+    - surgery_merge_type: Surgery behavior: 'fusion' (weight-space merge) or 'mixture' (output-space merge).
     """
 
     if seed is not None:
@@ -963,6 +1137,11 @@ def eval_datasets(
     results = []
     device = "cuda" if torch.cuda.is_available() else "cpu"
     methods_to_run = _resolve_eval_types(eval_type=eval_type, eval_types=eval_types)
+    surgery_merge_type = str(surgery_merge_type).strip().lower()
+    if surgery_merge_type not in ("fusion", "mixture"):
+        raise ValueError(
+            f"Invalid surgery_merge_type={surgery_merge_type}. Expected one of: fusion, mixture."
+        )
 
     init_vector_db(config_path)
 
@@ -1064,7 +1243,8 @@ def eval_datasets(
                     f"max_adapters_to_load={max_adapters_to_load})",
                 )
 
-                print("module_list:", module_list)
+                # print("module_list:", module_list)
+                # print("layerwisemapping_matrix:", layerwise_mapping_matrix)
                 if mapping_matrix is None:
                     raise ValueError(
                         "mapping_matrix is None. Retrieval may have failed or returned no adapters."
@@ -1181,32 +1361,53 @@ def eval_datasets(
                     for j, expected_answer in enumerate(eval_data["targets"][i : i + batch_size]):
                         applied_stats = None
                         surgery_applied = False
+                        mixture_stats = None
                         try:
-                            applied_stats = _apply_layerwise_weight_surgery(
-                                base_model=base_model,
-                                module_list=module_list,
-                                layerwise_mapping_matrix=layerwise_mapping_matrix,
-                                sample_idx=j,
-                                sign=1.0,
-                                layer_active_k=surgery_layer_top_k,
-                            )
-                            surgery_applied = True
-                            if retrieval_debug:
-                                print(f"[surgery-apply] sample_idx={i + j}, stats={applied_stats}")
-
                             single_inputs = {k: v[j : j + 1] for k, v in inputs.items()}
-                            surgery_outputs = base_model.generate(
-                                input_ids=single_inputs["input_ids"],
-                                attention_mask=single_inputs.get("attention_mask", None),
-                                max_new_tokens=50,
-                                do_sample=False,
-                                temperature=1.0,
-                            )
+                            if surgery_merge_type == "fusion":
+                                applied_stats = _apply_layerwise_weight_surgery(
+                                    base_model=base_model,
+                                    module_list=module_list,
+                                    layerwise_mapping_matrix=layerwise_mapping_matrix,
+                                    sample_idx=j,
+                                    sign=1.0,
+                                    layer_active_k=surgery_layer_top_k,
+                                )
+                                # print("Module List:", module_list)
+                                # print("Layerwise Mapping Matrix:", layerwise_mapping_matrix)
+                                # import sys
+                                # sys.exit()
+                                surgery_applied = True
+                                if retrieval_debug:
+                                    print(f"[surgery-apply] sample_idx={i + j}, stats={applied_stats}")
+
+                                surgery_outputs = base_model.generate(
+                                    input_ids=single_inputs["input_ids"],
+                                    attention_mask=single_inputs.get("attention_mask", None),
+                                    max_new_tokens=50,
+                                    do_sample=False,
+                                    temperature=1.0,
+                                )
+                            else:
+                                surgery_outputs, mixture_stats = _apply_layerwise_output_mixture(
+                                    base_model=base_model,
+                                    module_list=module_list,
+                                    layerwise_mapping_matrix=layerwise_mapping_matrix,
+                                    sample_idx=j,
+                                    input_ids=single_inputs["input_ids"],
+                                    attention_mask=single_inputs.get("attention_mask", None),
+                                    max_new_tokens=50,
+                                    do_sample=False,
+                                    temperature=1.0,
+                                    layer_active_k=surgery_layer_top_k,
+                                )
+                                if retrieval_debug:
+                                    print(f"[surgery-mixture] sample_idx={i + j}, stats={mixture_stats}")
                         except Exception as e:
                             print(
                                 f"exception (surgery) at sample_idx={i + j}, "
                                 f"domain={eval_data['domain'][i + j]}, task={eval_data['task'][i + j]}, "
-                                f"adapters={len(module_list)}: {e}"
+                                f"adapters={len(module_list)}, merge_type={surgery_merge_type}: {e}"
                             )
                             continue
                         finally:
@@ -1237,6 +1438,7 @@ def eval_datasets(
                             "domain": eval_data["domain"][i + j],
                             "task": eval_data["task"][i + j],
                             "composition_method": "surgery",
+                            "surgery_merge_type": surgery_merge_type,
                             "retrieval": retrieval_details[j],
                             "predicted_answer": generated_answer,
                         }
